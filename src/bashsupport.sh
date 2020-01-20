@@ -28,6 +28,8 @@ _sentry_err_trap() {
   _sentry_traceback 1
   echo "@command:${_command}" >> "$_SENTRY_TRACEBACK_FILE"
   echo "@exit_code:${_exit_code}" >> "$_SENTRY_TRACEBACK_FILE"
+
+  : >> "$_SENTRY_LOG_FILE"
   export SENTRY_LAST_EVENT=$("___SENTRY_CLI___" bash-hook --send-event --traceback "$_SENTRY_TRACEBACK_FILE" --log "$_SENTRY_LOG_FILE")
   rm -f "$_SENTRY_TRACEBACK_FILE" "$_SENTRY_LOG_FILE"
 }
@@ -50,6 +52,13 @@ _sentry_traceback() {
 }
 
 : > "$_SENTRY_LOG_FILE"
-exec \
-  1> >(tee >(awk '{ system(""); print strftime("%Y-%m-%d %H:%M:%S %z:"), "stdout:", $0; system(""); }' >> "$_SENTRY_LOG_FILE")) \
-  2> >(tee >(awk '{ system(""); print strftime("%Y-%m-%d %H:%M:%S %z:"), "stderr:", $0; system(""); }' >> "$_SENTRY_LOG_FILE") >&2)
+
+if command -v perl >/dev/null; then
+  exec \
+    1> >(tee >(perl '-MPOSIX' -ne '$|++; print strftime("%Y-%m-%d %H:%M:%S %z: ", localtime()), "stdout: ", $_;' >> "$_SENTRY_LOG_FILE")) \
+    2> >(tee >(perl '-MPOSIX' -ne '$|++; print strftime("%Y-%m-%d %H:%M:%S %z: ", localtime()), "stderr: ", $_;' >> "$_SENTRY_LOG_FILE") >&2)
+else
+  exec \
+    1> >(tee >(awk '{ system(""); print strftime("%Y-%m-%d %H:%M:%S %z:"), "stdout:", $0; system(""); }' >> "$_SENTRY_LOG_FILE")) \
+    2> >(tee >(awk '{ system(""); print strftime("%Y-%m-%d %H:%M:%S %z:"), "stderr:", $0; system(""); }' >> "$_SENTRY_LOG_FILE") >&2)
+fi

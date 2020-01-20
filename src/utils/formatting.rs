@@ -1,18 +1,20 @@
 use std::fmt;
 
-use prettytable;
 use chrono::Duration;
 
 /// Helper for formatting durations.
 pub struct HumanDuration(pub Duration);
 
 impl<'a> fmt::Display for HumanDuration {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         macro_rules! try_write {
             ($num:expr, $str:expr) => {
-                if $num == 1 { return write!(f, "1 {}", $str); }
-                else if $num > 1 { return write!(f, "{} {}s", $num, $str); }
-            }
+                if $num == 1 {
+                    return write!(f, "1 {}", $str);
+                } else if $num > 1 {
+                    return write!(f, "{} {}s", $num, $str);
+                }
+            };
         }
 
         try_write!(self.0.num_hours(), "hour");
@@ -28,27 +30,31 @@ pub struct Table {
 }
 
 pub struct TableRow {
-    cells: Vec<prettytable::cell::Cell>,
+    cells: Vec<prettytable::Cell>,
 }
 
 impl TableRow {
     pub fn new() -> TableRow {
-        TableRow {
-            cells: vec![],
-        }
+        TableRow { cells: vec![] }
     }
 
     pub fn add<D: fmt::Display>(&mut self, text: D) -> &mut TableRow {
-        self.cells.push(prettytable::cell::Cell::new(&text.to_string()));
+        self.cells.push(prettytable::Cell::new(&text.to_string()));
         self
     }
 
-    fn make_row(&self) -> prettytable::row::Row {
-        let mut row = prettytable::row::Row::empty();
+    fn make_row(&self) -> prettytable::Row {
+        let mut row = prettytable::Row::empty();
         for cell in &self.cells {
             row.add_cell(cell.clone());
         }
         row
+    }
+}
+
+impl Default for TableRow {
+    fn default() -> Self {
+        TableRow::new()
     }
 }
 
@@ -90,5 +96,11 @@ impl Table {
             tbl.add_row(row.make_row());
         }
         tbl.print_tty(false);
+    }
+}
+
+impl Default for Table {
+    fn default() -> Self {
+        Table::new()
     }
 }

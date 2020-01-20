@@ -1,5 +1,286 @@
 # Changelog
 
+## sentry-cli 1.49.0
+
+* Detect Heroku's `SOURCE_VERSION` environment variable (#613)
+* Allow extensions with dots for sourcemap uploads (#605)
+* Fix validation of `releases set-commits` options in JS (#618)
+* Add an optional column for project slugs in `releases list` (#612)
+* Add an optional `--wait` flag for upload-dif (#619)
+
+**NOTE**: This release changes the default behavior of `upload-dif`. Previously,
+the command waited until Sentry had fully processed uploaded files. Now, the
+command terminates after a successful upload but does not wait for server-side
+processing. This will speed up uploads for the common case. Specify `--wait` for
+the old behavior if you want to make sure that debug files are available before
+sending native events.
+
+## sentry-cli 1.48.0
+
+* Add support for Brotli, GZip and Deflate compression algorithms for binary download (#607)
+* Fix binary download progress bar calculations (#606)
+
+## sentry-cli 1.47.2
+
+**Changes**:
+* Always show the full version in `releases list` (#584).
+* Do not warn when using the standard docker entrypoint.
+
+**JavaScript API**:
+* Pass the `silent` option to `releases` commands in JavaScript (#552).
+* Allow setting commits on a release in JavaScript (#580).
+
+**Fixed bugs**:
+* Fix an error in the bash hook if the log file gets deleted (#583).
+* Fix detection of Azure repositories in `releases set-commits` (#576).
+* Fix detection of annotated tags in `releases set-commits` (#598).
+* Fix normalization of sourcemap URL prefixes with trailing slashes (#599).
+* Fix upload of source bundles created with `difutil bundle-sources` (#602).
+
+## sentry-cli 1.47.1
+
+* Fix potentially broken payloads in `send-event`.
+
+## sentry-cli 1.47.0
+
+* Trim whitespace in header values to prevent potential header injections
+  through the auth token header. (#563)
+* Improved Azure DevOps URL parsing. (#556)
+
+## sentry-cli 1.46.0
+
+* Relax the release file limit for sourcemap uploads when artifact bundles
+  are supported by the serntry server (#559)
+
+## sentry-cli 1.45.0
+
+* Allow ports in VCS urls when associating commits (#551)
+* Support PDB and PE uploads to Sentry (#553)
+
+## sentry-cli 1.44.4
+
+* Emit better version names for react native (#506)
+* Fix a regression in sourcemap uploads for certain release names (#549)
+* Ensure case insensitive git repository matching (#511)
+
+## sentry-cli 1.44.3
+
+* Fix a regression with URL prefixes in sourcemap uploads (#544)
+
+## sentry-cli 1.44.2
+
+* Even faster sourcemap uploads to sentry.io (#540, #542)
+
+## sentry-cli 1.44.1
+
+* Fixed a segfault in curl on empty file uploading (#535)
+
+## sentry-cli 1.44.0
+
+* Parallelize source map uploads (#533)
+
+## sentry-cli 1.43.0
+
+* Add support for File RAM Bundles (#528)
+* Accept more Azure DevOps URLs (#525)
+
+## sentry-cli 1.42.0
+
+* Add support for Indexed RAM Bundles (#523)
+* Add "silent" option to JS constructor (#512)
+
+## sentry-cli 1.41.2
+
+* Fix slow unzipping in debug file upload (#519)
+
+## sentry-cli 1.41.1
+
+* Warn before uploading more than 20.000 files to a release (#513)
+
+## sentry-cli 1.41.0
+
+* Recognizes GNU compressed debug files on Linux
+* Also uploads Breakpad files and ELF files only containing symbol tables
+
+## sentry-cli 1.40.0
+
+* Automatically retry on various socket and SSL errors (#466, #490)
+* Use a connection pool for the outgoing API requests.  This is likely to resolve
+  some issues in curl itself that manifested itself as malloc errors on shutdown (#489)
+* Upgrade internal dependencies and shrink overall binary (#488)
+* Upgrade internal sentry crate
+
+## sentry-cli 1.39.1
+
+* Fix Proguard upload issues on Windows (#484).
+
+## sentry-cli 1.39.0
+
+* Release enabling an internal sentry experiment.
+
+## sentry-cli 1.38.1
+
+* Fix plist parsing
+
+## sentry-cli 1.38.0
+
+* Upgraded symbolic which offers support top R8 code shrinker.
+
+## sentry-cli 1.37.4
+
+* Added `SENTRY_NO_PROGRESS_BAR` environment variable to suppress progress
+  bars (#467)
+* Fixed an issue where dif uploads would indicate failure if no files where
+  to upload.
+
+## sentry-cli 1.37.3
+
+* Report non zero status for server side processing errors on dif upload (#465)
+* Improve error messages for 502/504 (#459)
+* Relax VCS url comparisions to improve on-prem support
+
+## sentry-cli 1.37.2
+
+* Retry on upload-related operations (chunk-upload, assemble) (#456)
+* Add new anylog version (#455)
+
+## sentry-cli 1.37.1
+
+* Fix the detection of debug information in ELF files (#437)
+* Add support for ELF files in the `difutil` commands (#447)
+* Speed up `sentry-cli update` by using the Sentry release registry (#438)
+* Dump http requests in debug mode for better debugging (#448)
+
+## sentry-cli 1.37.0
+
+* Support React Native >= 0.46 (@stephan-nordnes-eriksen, #377)
+* Cache binaries to speed up NPM package installation (@timfish, #425)
+* Check for successful upload of debug files (#429)
+* Limit debug file uploads to 2GB (maximum allowed by Sentry) (#432)
+
+## sentry-cli 1.36.4
+
+* Add support for GitLab in `releases set-commits` (#419)
+* Fix a bug where uploaded debug files might show up as _"Generic"_ (#420)
+
+## sentry-cli 1.36.3
+
+* Print out how sentry-cli was invoked in debug log
+
+## sentry-cli 1.36.2
+
+* Download packages from Fastly's CDN when installing via NPM and Brew (#417)
+* Allow uploading executables and debug symbols in one go (#412)
+
+## sentry-cli 1.36.1
+
+* Fixes a bug that prevented listing and creating releases
+
+## sentry-cli 1.36.0
+
+* Show project IDs in project listing (#384)
+* Fetch all projects, repos and releases if you have more than 100 (#388, #390)
+* Support debug symbols with DWARF 5 debug information (#389)
+* Fix `--no-environ` parameter in `send-event` (#391)
+* Remove a misleading success message in `send-event` (#397)
+* Improve debug logs and error output (#393, #394, #399)
+
+## sentry-cli 1.35.6
+
+* Fix a bug introduced with the `--url-suffix` option in `upload-sourcemaps`
+* Fix broken commit detection for releases (#378, #381)
+
+## sentry-cli 1.35.5
+
+* Add `--url-suffix` option for `upload-sourcemaps` (#373)
+
+## sentry-cli 1.35.4
+
+* Additional compatibility improvements for the Docker image (#368)
+
+## sentry-cli 1.35.3
+
+* Add a warning about new Docker entrypoint (#367)
+
+## sentry-cli 1.35.2
+
+* Change entrypoint for Docker image (#358)
+* Use `perl` over `strftime` in bash hook (#359)
+* Fix iTunes Connect BCSymbolMap handling in `upload-dif` (#362)
+* Display error messages when re-uploading broken DIFs (#363)
+
+## sentry-cli 1.35.1
+
+* Resolve a hang on certain windows versions on shutdown (#349)
+
+## sentry-cli 1.34.0
+
+* Improve the error message for renamed projects (#330)
+* Fix appcenter commands on Windows (#331)
+* Fix grammar in some help texts (#337, @gorgos)
+* Fix frozen upload-dif on some Windows versions (#342)
+
+## sentry-cli 1.33.0
+
+* Add support for AppCenter CLI for codepush releases (#327)
+* Deprecate the codepush CLI command (#327)
+* Fix a bug where commands would fail with connection errors
+
+## sentry-cli 1.32.3
+
+* Skip invalid ZIP files during debug file upload (#320)
+* Generate better error messages for renamed projects (#321)
+
+## sentry-cli 1.32.2
+
+* Compress debug symbols for faster uploads (#315)
+* Refactor `send-event` to include more consistent information (#316, #318)
+
+## sentry-cli 1.32.1
+
+* Improve update prompts (#306, @danielcompton)
+* Support event environments in bash hook (#312, @geniass)
+* Use `DWARF_DSYM_FOLDER_PATH` in upload-dsym (#313)
+* Skip malformed object files during upload scan (#313)
+
+## sentry-cli 1.32.0
+
+* Drop support for older macOS versions to work around an old xcode linker bug
+
+## sentry-cli 1.31.2
+
+* Disabled automatic crash reporting
+
+## sentry-cli 1.31.1
+
+* Fixed out of bounds panic for sourcemaps without sources (#299)
+* Fixed commit detection when VSTS was used (#300)
+
+## sentry-cli 1.31.0
+
+* Restrict file permissions for newly created `.sentryclirc` (#296)
+* Fix `SENTRY_DSN` environment variable parsing for `send-event` action (#292)
+* Build statically linked `musl`-based binaries for Linux (#294)
+* Detect `HEROKU_SLUG_COMMIT` in propose-version (#298)
+
+## sentry-cli 1.30.5
+
+* Add better error diagnostics (internal change, #288)
+
+## sentry-cli 1.30.4
+
+* Show correct identifiers when uploading Windows symbols (#280)
+
+## sentry-cli 1.30.3
+
+* Attempted to make the windows executable more portable (#269)
+* Fixed the JavaScript API (#270)
+* Fixed a bug where breadcrumbs were not always sent (#268)
+
+## sentry-cli 1.30.2
+
+* Fixed #252
+
 ## sentry-cli 1.30.1
 
 * Expose `execute` on SentryCli js wrapper

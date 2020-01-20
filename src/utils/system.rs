@@ -1,46 +1,50 @@
-use std::io;
-use std::io::Write;
-use std::process;
-use std::env;
 use std::borrow::Cow;
+use std::env;
+use std::process;
 
-use config::Config;
-
-#[cfg(not(windows))]
-use chan_signal::{notify, Signal};
 use chrono::{DateTime, Utc};
+use console::style;
+use failure::{Error, Fail};
+use lazy_static::lazy_static;
 use regex::{Captures, Regex};
 
-use errors::{Error, ErrorKind, Result};
+use crate::config::Config;
 
 #[cfg(not(windows))]
 pub fn run_or_interrupt<F>(f: F)
-    where F: FnOnce() -> (), F: Send + 'static
+where
+    F: FnOnce() -> () + Send + 'static,
 {
-    use chan;
-    let run = |_sdone: chan::Sender<()>| f();
-    let signal = notify(&[Signal::INT, Signal::TERM]);
-    let (sdone, rdone) = chan::sync(0);
-    ::std::thread::spawn(move || run(sdone));
+    let (tx, rx) = crossbeam_channel::bounded(100);
+    let signals =
+        signal_hook::iterator::Signals::new(&[signal_hook::SIGTERM, signal_hook::SIGINT]).unwrap();
 
-    let mut rv = None;
-
-    chan_select! {
-        signal.recv() -> signal => { rv = signal; },
-        rdone.recv() => {}
+    {
+        let tx = tx.clone();
+        std::thread::spawn(move || {
+            f();
+            tx.send(0).ok();
+        });
     }
 
-    if let Some(signal) = rv {
-        use chan_signal::Signal;
-        if signal == Signal::INT {
-            println!("Interrupted!");
+    std::thread::spawn(move || {
+        for signal in signals.forever() {
+            tx.send(signal).ok();
+        }
+    });
+
+    if let Ok(signal) = rx.recv() {
+        if signal == signal_hook::SIGINT {
+            eprintln!("Interrupted!");
         }
     }
 }
 
 #[cfg(windows)]
 pub fn run_or_interrupt<F>(f: F)
-    where F: FnOnce() -> (), F: Send + 'static
+where
+    F: FnOnce() -> (),
+    F: Send + 'static,
 {
     f();
 }
@@ -57,7 +61,7 @@ pub fn propagate_exit_status(status: process::ExitStatus) {
 }
 
 #[cfg(not(windows))]
-fn is_homebrew_install_result() -> Result<bool> {
+fn is_homebrew_install_result() -> Result<bool, Error> {
     let mut exe = env::current_exe()?.canonicalize()?;
     exe.pop();
     exe.set_file_name("INSTALL_RECEIPT.json");
@@ -65,13 +69,12 @@ fn is_homebrew_install_result() -> Result<bool> {
 }
 
 #[cfg(windows)]
-fn is_homebrew_install_result() -> Result<bool> {
+fn is_homebrew_install_result() -> Result<bool, Error> {
     Ok(false)
 }
 
-fn is_npm_install_result() -> Result<bool> {
+fn is_npm_install_result() -> Result<bool, Error> {
     let mut exe = env::current_exe()?.canonicalize()?;
-    exe.pop();
     exe.set_file_name("package.json");
     Ok(exe.is_file())
 }
@@ -87,19 +90,16 @@ pub fn is_npm_install() -> bool {
 }
 
 /// Expands environment variables in a string
-pub fn expand_envvars<'a>(s: &'a str) -> Cow<'a, str> {
-    expand_vars(s, |key| {
-        env::var(key).unwrap_or("".into())
-    })
+pub fn expand_envvars(s: &str) -> Cow<'_, str> {
+    expand_vars(s, |key| env::var(key).unwrap_or_else(|_| "".to_string()))
 }
 
 /// Expands variables in a string
-pub fn expand_vars<'a, F: Fn(&str) -> String>(s: &'a str, f: F) -> Cow<'a, str> {
+pub fn expand_vars<F: Fn(&str) -> String>(s: &str, f: F) -> Cow<'_, str> {
     lazy_static! {
-        static ref VAR_RE: Regex = Regex::new(
-            r"\$(\$|[a-zA-Z0-9_]+|\([^)]+\)|\{[^}]+\})").unwrap();
+        static ref VAR_RE: Regex = Regex::new(r"\$(\$|[a-zA-Z0-9_]+|\([^)]+\)|\{[^}]+\})").unwrap();
     }
-    VAR_RE.replace_all(s, |caps: &Captures| {
+    VAR_RE.replace_all(s, |caps: &Captures<'_>| {
         let key = &caps[1];
         if key == "$" {
             "$".into()
@@ -113,22 +113,30 @@ pub fn expand_vars<'a, F: Fn(&str) -> String>(s: &'a str, f: F) -> Cow<'a, str> 
 
 /// Helper that renders an error to stderr.
 pub fn print_error(err: &Error) {
-    use std::error::Error;
-
-    if let &ErrorKind::Clap(ref clap_err) = err.kind() {
+    if let Some(ref clap_err) = err.downcast_ref::<clap::Error>() {
         clap_err.exit();
     }
 
-    writeln!(&mut io::stderr(), "error: {}", err).ok();
-    let mut cause = err.cause();
-    while let Some(the_cause) = cause {
-        writeln!(&mut io::stderr(), "  caused by: {}", the_cause).ok();
-        cause = the_cause.cause();
+    for (idx, cause) in err.iter_chain().enumerate() {
+        match idx {
+            0 => eprintln!("{} {}", style("error:").red(), cause),
+            _ => eprintln!("  {} {}", style("caused by:").dim(), cause),
+        }
+    }
+
+    if Config::current().get_log_level() < log::LevelFilter::Info {
+        eprintln!();
+        eprintln!("{}", style("Add --log-level=[info|debug] or export SENTRY_LOG_LEVEL=[info|debug] to see more output.").dim());
+        eprintln!(
+            "{}",
+            style("Please attach the full debug log to all bug reports.").dim()
+        );
     }
 
     if env::var("RUST_BACKTRACE") == Ok("1".into()) {
-        writeln!(&mut io::stderr(), "").ok();
-        writeln!(&mut io::stderr(), "{:?}", err.backtrace()).ok();
+        eprintln!();
+        let backtrace = format!("{:?}", err.backtrace());
+        eprintln!("{}", style(&backtrace).dim());
     }
 }
 
@@ -139,68 +147,78 @@ pub fn to_timestamp(tm: DateTime<Utc>) -> f64 {
 
 /// Initializes the backtrace support
 pub fn init_backtrace() {
-    use backtrace::Backtrace;
-    use std::panic;
-    use std::thread;
+    std::panic::set_hook(Box::new(|info| {
+        let backtrace = backtrace::Backtrace::new();
 
-    panic::set_hook(Box::new(|info| {
-        let backtrace = Backtrace::new();
-
-        let thread = thread::current();
+        let thread = std::thread::current();
         let thread = thread.name().unwrap_or("unnamed");
 
         let msg = match info.payload().downcast_ref::<&'static str>() {
             Some(s) => *s,
-            None => {
-                match info.payload().downcast_ref::<String>() {
-                    Some(s) => &**s,
-                    None => "Box<Any>",
-                }
-            }
+            None => match info.payload().downcast_ref::<String>() {
+                Some(s) => &**s,
+                None => "Box<Any>",
+            },
         };
 
         match info.location() {
             Some(location) => {
-                println_stderr!("thread '{}' panicked at '{}': {}:{}\n\n{:?}",
-                         thread,
-                         msg,
-                         location.file(),
-                         location.line(),
-                         backtrace);
+                eprintln!(
+                    "thread '{}' panicked at '{}': {}:{}\n\n{:?}",
+                    thread,
+                    msg,
+                    location.file(),
+                    location.line(),
+                    backtrace
+                );
             }
-            None => println_stderr!("thread '{}' panicked at '{}'{:?}", thread, msg, backtrace),
+            None => eprintln!("thread '{}' panicked at '{}'{:?}", thread, msg, backtrace),
+        }
+
+        #[cfg(feature = "with_client_implementation")]
+        {
+            crate::utils::crashreporting::flush_events();
         }
     }));
 }
 
-#[cfg(target_os="macos")]
+#[cfg(target_os = "macos")]
 pub fn get_model() -> Option<String> {
-    if let Some(model) = Config::get_current().get_model() {
+    if let Some(model) = Config::current().get_model() {
         return Some(model);
     }
 
     use std::ptr;
-    use libc;
-    use libc::c_void;
 
     unsafe {
         let mut size = 0;
-        libc::sysctlbyname("hw.model\x00".as_ptr() as *const i8,
-            ptr::null_mut(), &mut size, ptr::null_mut(), 0);
+        libc::sysctlbyname(
+            "hw.model\x00".as_ptr() as *const i8,
+            ptr::null_mut(),
+            &mut size,
+            ptr::null_mut(),
+            0,
+        );
         let mut buf = vec![0u8; size as usize];
-        libc::sysctlbyname("hw.model\x00".as_ptr() as *const i8,
-            buf.as_mut_ptr() as *mut c_void, &mut size, ptr::null_mut(), 0);
+        libc::sysctlbyname(
+            "hw.model\x00".as_ptr() as *const i8,
+            buf.as_mut_ptr() as *mut libc::c_void,
+            &mut size,
+            ptr::null_mut(),
+            0,
+        );
         Some(String::from_utf8_lossy(&buf).to_string())
     }
 }
 
-#[cfg(target_os="macos")]
+#[cfg(target_os = "macos")]
 pub fn get_family() -> Option<String> {
-    if let Some(family) = Config::get_current().get_family() {
+    if let Some(family) = Config::current().get_family() {
         return Some(family);
     }
 
-    use regex::Regex;
+    use if_chain::if_chain;
+
     lazy_static! {
         static ref FAMILY_RE: Regex = Regex::new(r#"([a-zA-Z]+)\d"#).unwrap();
     }
@@ -217,12 +235,27 @@ pub fn get_family() -> Option<String> {
     }
 }
 
-#[cfg(not(target_os="macos"))]
+#[cfg(not(target_os = "macos"))]
 pub fn get_model() -> Option<String> {
-    Config::get_current().get_model()
+    Config::current().get_model()
 }
 
-#[cfg(not(target_os="macos"))]
+#[cfg(not(target_os = "macos"))]
 pub fn get_family() -> Option<String> {
-    Config::get_current().get_family()
+    Config::current().get_family()
+}
+
+/// Indicates that sentry-cli should quit without printing anything.
+#[derive(Fail, Debug)]
+#[fail(display = "sentry-cli exit with {}", _0)]
+pub struct QuietExit(pub i32);
+
+/// Loads a .env file
+pub fn load_dotenv() {
+    if env::var("SENTRY_LOAD_DOTENV")
+        .map(|x| x.as_str() == "1")
+        .unwrap_or(true)
+    {
+        dotenv::dotenv().ok();
+    }
 }

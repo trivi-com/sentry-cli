@@ -1,23 +1,25 @@
-use clap::{App, ArgMatches, AppSettings};
+use clap::{App, AppSettings, ArgMatches};
+use failure::Error;
 
-use commands;
-use errors::Result;
+use crate::commands;
 
 macro_rules! each_subcommand {
     ($mac:ident) => {
         $mac!(react_native_gradle);
+        $mac!(react_native_appcenter);
         $mac!(react_native_codepush);
-        #[cfg(target_os="macos")]
+        #[cfg(target_os = "macos")]
         $mac!(react_native_xcode);
-    }
+    };
 }
 
 pub fn make_app<'a, 'b: 'a>(mut app: App<'a, 'b>) -> App<'a, 'b> {
     macro_rules! add_subcommand {
         ($name:ident) => {{
-            app = app.subcommand(commands::$name::make_app(
-                App::new(&stringify!($name)[13..])));
-        }}
+            app = app.subcommand(commands::$name::make_app(App::new(
+                &stringify!($name)[13..],
+            )));
+        }};
     }
 
     app = app
@@ -27,13 +29,13 @@ pub fn make_app<'a, 'b: 'a>(mut app: App<'a, 'b>) -> App<'a, 'b> {
     app
 }
 
-pub fn execute<'a>(matches: &ArgMatches<'a>) -> Result<()> {
+pub fn execute<'a>(matches: &ArgMatches<'a>) -> Result<(), Error> {
     macro_rules! execute_subcommand {
         ($name:ident) => {{
             if let Some(sub_matches) = matches.subcommand_matches(&stringify!($name)[13..]) {
                 return Ok(commands::$name::execute(&sub_matches)?);
             }
-        }}
+        }};
     }
     each_subcommand!(execute_subcommand);
     unreachable!();

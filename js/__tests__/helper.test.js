@@ -81,6 +81,17 @@ describe('SentryCli helper', () => {
       ['releases', 'files', 'release', 'upload-sourcemaps', '/dev/null', '--rewrite']
     );
 
+    expect(
+      helper.prepareCommand(command, SOURCEMAPS_OPTIONS, { rewrite: false })
+    ).toEqual([
+      'releases',
+      'files',
+      'release',
+      'upload-sourcemaps',
+      '/dev/null',
+      '--no-rewrite',
+    ]);
+
     expect(() => {
       helper.prepareCommand(command, SOURCEMAPS_OPTIONS, { sourceMapReference: 'node' });
     }).toThrow();
@@ -109,6 +120,18 @@ describe('SentryCli helper', () => {
       '/dev/null',
       '--url-prefix',
       '~/',
+    ]);
+
+    expect(
+      helper.prepareCommand(command, SOURCEMAPS_OPTIONS, { urlSuffix: '?hash=1337' })
+    ).toEqual([
+      'releases',
+      'files',
+      'release',
+      'upload-sourcemaps',
+      '/dev/null',
+      '--url-suffix',
+      '?hash=1337',
     ]);
 
     expect(

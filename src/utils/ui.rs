@@ -1,7 +1,7 @@
 use std::io;
 use std::io::{Read, Write};
 
-use indicatif::{ProgressBar, ProgressStyle};
+use crate::utils::progress::{ProgressBar, ProgressStyle};
 
 /// Prints a message and loops until yes or no is entered.
 pub fn prompt_to_continue(message: &str) -> io::Result<bool> {
@@ -30,7 +30,7 @@ pub fn prompt(message: &str) -> io::Result<String> {
         let mut buf = String::new();
         io::stdin().read_line(&mut buf)?;
         let input = buf.trim();
-        if input.len() > 0 {
+        if !input.is_empty() {
             return Ok(input.to_owned());
         }
     }
@@ -45,10 +45,14 @@ pub fn capitalize_string(s: &str) -> String {
 }
 
 /// Like ``io::copy`` but advances a progress bar set to bytes.
-pub fn copy_with_progress<R: ?Sized, W: ?Sized>(progress: &ProgressBar,
-                                                reader: &mut R, writer: &mut W)
-    -> io::Result<u64>
-    where R: Read, W: Write
+pub fn copy_with_progress<R: ?Sized, W: ?Sized>(
+    progress: &ProgressBar,
+    reader: &mut R,
+    writer: &mut W,
+) -> io::Result<u64>
+where
+    R: Read,
+    W: Write,
 {
     let mut buf = [0; 16384];
     let mut written = 0;
@@ -68,7 +72,8 @@ pub fn copy_with_progress<R: ?Sized, W: ?Sized>(progress: &ProgressBar,
 /// Creates a progress bar for byte stuff
 pub fn make_byte_progress_bar(length: u64) -> ProgressBar {
     let pb = ProgressBar::new(length);
-    pb.set_style(ProgressStyle::default_bar()
-        .template("{wide_bar}  {bytes}/{total_bytes} ({eta})"));
+    pb.set_style(
+        ProgressStyle::default_bar().template("{wide_bar}  {bytes}/{total_bytes} ({eta})"),
+    );
     pb
 }

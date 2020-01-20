@@ -1,57 +1,62 @@
 //! Implements a command for managing releases.
-use std::path::Path;
-use std::rc::Rc;
 use std::collections::HashSet;
+use std::ffi::OsStr;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
-use clap::{App, AppSettings, Arg, ArgMatches};
 use chrono::{DateTime, Duration, Utc};
-use ignore::WalkBuilder;
-use ignore::types::TypesBuilder;
+use clap::{App, AppSettings, Arg, ArgMatches};
+use failure::{bail, err_msg, Error};
 use ignore::overrides::OverrideBuilder;
+use ignore::types::TypesBuilder;
+use ignore::WalkBuilder;
 use indicatif::HumanBytes;
+use lazy_static::lazy_static;
+use log::{debug, info, warn};
 use regex::Regex;
 
-use api::{Api, Deploy, FileContents, NewRelease, UpdatedRelease};
-use config::Config;
-use errors::{Error, ErrorKind, Result};
-use utils::args::{get_timestamp, validate_project, validate_seconds, validate_timestamp, ArgExt};
-use utils::formatting::{HumanDuration, Table};
-use utils::releases::detect_release_name;
-use utils::sourcemaps::SourceMapProcessor;
-use utils::vcs::{find_heads, CommitSpec};
+use crate::api::{Api, Deploy, FileContents, NewRelease, ProgressBarMode, UpdatedRelease};
+use crate::config::Config;
+use crate::utils::args::{
+    get_timestamp, validate_project, validate_seconds, validate_timestamp, ArgExt,
+};
+use crate::utils::formatting::{HumanDuration, Table};
+use crate::utils::releases::detect_release_name;
+use crate::utils::sourcemaps::{SourceMapProcessor, UploadContext};
+use crate::utils::system::QuietExit;
+use crate::utils::vcs::{find_heads, CommitSpec};
 
 struct ReleaseContext<'a> {
-    pub api: Rc<Api>,
+    pub api: Arc<Api>,
     pub org: String,
     pub project_default: Option<&'a str>,
 }
 
 impl<'a> ReleaseContext<'a> {
-    pub fn get_org(&'a self) -> Result<&str> {
+    pub fn get_org(&'a self) -> Result<&str, Error> {
         Ok(&self.org)
     }
 
-    pub fn get_project_default(&'a self) -> Result<String> {
+    pub fn get_project_default(&'a self) -> Result<String, Error> {
         if let Some(ref proj) = self.project_default {
             Ok(proj.to_string())
         } else {
-            let config = Config::get_current();
+            let config = Config::current();
             Ok(config.get_project_default()?)
         }
     }
 
-    pub fn get_projects(&'a self, matches: &ArgMatches<'a>) -> Result<Vec<String>> {
+    pub fn get_projects(&'a self, matches: &ArgMatches<'a>) -> Result<Vec<String>, Error> {
         if let Some(projects) = matches.values_of("projects") {
-             Ok(projects.map(|x| x.to_string()).collect())
+            Ok(projects.map(str::to_owned).collect())
         } else if let Some(project) = self.project_default {
             Ok(vec![project.to_string()])
         } else {
-            let config = Config::get_current();
+            let config = Config::current();
             Ok(vec![config.get_project_default()?])
         }
     }
 }
-
 
 pub fn make_app<'a, 'b: 'a>(app: App<'a, 'b>) -> App<'a, 'b> {
     app.about("Manage releases on Sentry.")
@@ -133,7 +138,11 @@ pub fn make_app<'a, 'b: 'a>(app: App<'a, 'b>) -> App<'a, 'b> {
             .about("List the most recent releases.")
             .arg(Arg::with_name("no_abbrev")
                 .long("no-abbrev")
-                .help("Do not abbreviate the release version.")))
+                .hidden(true))
+            .arg(Arg::with_name("show_projects")
+                .short("P")
+                .long("show-projects")
+                .help("Display the Projects column")))
         .subcommand(App::new("info")
             .about("Print information about a release.")
             .version_arg(1)
@@ -187,7 +196,7 @@ pub fn make_app<'a, 'b: 'a>(app: App<'a, 'b>) -> App<'a, 'b> {
                 .arg(Arg::with_name("paths")
                     .value_name("PATHS")
                     .index(1)
-                    .required(true)
+                    .required_unless_one(&["bundle", "bundle_sourcemap"])
                     .multiple(true)
                     .help("The files to upload."))
                 .arg(Arg::with_name("url_prefix")
@@ -195,6 +204,10 @@ pub fn make_app<'a, 'b: 'a>(app: App<'a, 'b>) -> App<'a, 'b> {
                     .long("url-prefix")
                     .value_name("PREFIX")
                     .help("The URL prefix to prepend to all filenames."))
+                .arg(Arg::with_name("url_suffix")
+                    .long("url-suffix")
+                    .value_name("SUFFIX")
+                    .help("The URL suffix to append to all filenames."))
                 .arg(Arg::with_name("dist")
                     .long("dist")
                     .short("d")
@@ -203,6 +216,9 @@ pub fn make_app<'a, 'b: 'a>(app: App<'a, 'b>) -> App<'a, 'b> {
                 .arg(Arg::with_name("validate")
                     .long("validate")
                     .help("Enable basic sourcemap validation."))
+                .arg(Arg::with_name("wait")
+                    .long("wait")
+                    .help("Wait for the server to fully process uploaded files."))
                 .arg(Arg::with_name("no_sourcemap_reference")
                     .long("no-sourcemap-reference")
                     .help("Disable emitting of automatic sourcemap references.{n}\
@@ -212,13 +228,8 @@ pub fn make_app<'a, 'b: 'a>(app: App<'a, 'b>) -> App<'a, 'b> {
                            be disabled."))
                 .arg(Arg::with_name("no_rewrite")
                     .long("no-rewrite")
-                    .help("Disables rewriting of matching sourcemaps \
-                           so that indexed maps are flattened and missing \
-                           sources are inlined if possible.{n}This fundamentally \
-                           changes the upload process to be based on sourcemaps \
-                           and minified files exclusively and comes in handy for \
-                           setups like react-native that generate sourcemaps that \
-                           would otherwise not work for sentry."))
+                    .help("The opposite of --rewrite. By default sourcemaps are not rewritten.")
+                    .conflicts_with("rewrite"))
                 .arg(Arg::with_name("rewrite")
                     .long("rewrite")
                     .help("Enables rewriting of matching sourcemaps \
@@ -227,18 +238,25 @@ pub fn make_app<'a, 'b: 'a>(app: App<'a, 'b>) -> App<'a, 'b> {
                            changes the upload process to be based on sourcemaps \
                            and minified files exclusively and comes in handy for \
                            setups like react-native that generate sourcemaps that \
-                           would otherwise not work for sentry."))
+                           would otherwise not work for sentry.")
+                    .conflicts_with("no_rewrite"))
                 .arg(Arg::with_name("strip_prefix")
                     .long("strip-prefix")
                     .value_name("PREFIX")
                     .multiple(true)
                     .number_of_values(1)
-                    .help("Strip the given prefix from all filenames.{n}\
-                           Only files that start with the given prefix will be stripped."))
+                    .help("When used with a `--rewrite` option, strips the given prefix from \
+                           all sources references inside the upload sourcemaps (paths used within \
+                           the sourcemap content, to map minified code to it's original source). \
+                           Only sources that start with the given prefix will be stripped.{n}\
+                           This will not modify the uploaded sources paths. To do that, point the upload \
+                           or upload-sourcemaps command to a more precise directory instead.")
+                    .conflicts_with("no_rewrite"))
                 .arg(Arg::with_name("strip_common_prefix")
                     .long("strip-common-prefix")
                     .help("Similar to --strip-prefix but strips the most common \
-                           prefix on all sources."))
+                           prefix on all sources references.")
+                    .conflicts_with("no_rewrite"))
                 .arg(Arg::with_name("ignore")
                     .long("ignore")
                     .short("i")
@@ -251,6 +269,18 @@ pub fn make_app<'a, 'b: 'a>(app: App<'a, 'b>) -> App<'a, 'b> {
                     .value_name("IGNORE_FILE")
                     .help("Ignore all files and folders specified in the given \
                            ignore file, e.g. .gitignore."))
+                .arg(Arg::with_name("bundle")
+                    .long("bundle")
+                    .value_name("BUNDLE")
+                    .conflicts_with("paths")
+                    .requires_all(&["bundle_sourcemap"])
+                    .help("Path to the application bundle (indexed, file, or regular)"))
+                .arg(Arg::with_name("bundle_sourcemap")
+                    .long("bundle-sourcemap")
+                    .value_name("BUNDLE_SOURCEMAP")
+                    .conflicts_with("paths")
+                    .requires_all(&["bundle"])
+                    .help("Path to the bundle sourcemap"))
                 // legacy parameter
                 .arg(Arg::with_name("verbose")
                     .long("verbose")
@@ -262,7 +292,10 @@ pub fn make_app<'a, 'b: 'a>(app: App<'a, 'b>) -> App<'a, 'b> {
                     .value_name("EXT")
                     .multiple(true)
                     .number_of_values(1)
-                    .help("Add a file extension to the list of files to upload."))))
+                    .help("Set the file extensions that are considered for upload. \
+                           This overrides the default extensions. To add an extension, all default \
+                           extensions must be repeated. Specify once per extension.{n}\
+                           Defaults to: `--ext=js --ext=map --ext=jsbundle --ext=bundle`"))))
         .subcommand(App::new("deploys")
             .about("Manage release deployments.")
             .setting(AppSettings::SubcommandRequiredElseHelp)
@@ -318,18 +351,6 @@ fn strip_sha(sha: &str) -> &str {
     }
 }
 
-fn strip_version(version: &str) -> &str {
-    lazy_static! {
-        static ref DOTTED_PATH_PREFIX_RE: Regex = Regex::new(
-            r"^([a-z][a-z0-9-]+)(\.[a-z][a-z0-9-]+)+-").unwrap();
-    }
-    if let Some(m) = DOTTED_PATH_PREFIX_RE.find(version) {
-        strip_sha(&version[m.end()..])
-    } else {
-        strip_sha(version)
-    }
-}
-
 #[cfg(windows)]
 fn path_as_url(path: &Path) -> String {
     path.display().to_string().replace("\\", "/")
@@ -340,72 +361,83 @@ fn path_as_url(path: &Path) -> String {
     path.display().to_string()
 }
 
-fn execute_new<'a>(ctx: &ReleaseContext,
-                   matches: &ArgMatches<'a>) -> Result<()> {
-    let info_rv = ctx.api.new_release(ctx.get_org()?,
+fn execute_new<'a>(ctx: &ReleaseContext<'_>, matches: &ArgMatches<'a>) -> Result<(), Error> {
+    let info_rv = ctx.api.new_release(
+        ctx.get_org()?,
         &NewRelease {
             version: matches.value_of("version").unwrap().to_owned(),
             projects: ctx.get_projects(matches)?,
-            url: matches.value_of("url").map(|x| x.to_owned()),
+            url: matches.value_of("url").map(str::to_owned),
             date_started: Some(Utc::now()),
             date_released: if matches.is_present("finalize") {
                 Some(Utc::now())
             } else {
                 None
             },
-            ..Default::default()
-        })?;
+        },
+    )?;
     println!("Created release {}.", info_rv.version);
     Ok(())
 }
 
-fn execute_finalize<'a>(ctx: &ReleaseContext,
-                        matches: &ArgMatches<'a>) -> Result<()> {
-    fn get_date(value: Option<&str>, now_default: bool) -> Result<Option<DateTime<Utc>>> {
+fn execute_finalize<'a>(ctx: &ReleaseContext<'_>, matches: &ArgMatches<'a>) -> Result<(), Error> {
+    fn get_date(value: Option<&str>, now_default: bool) -> Result<Option<DateTime<Utc>>, Error> {
         match value {
             None => Ok(if now_default { Some(Utc::now()) } else { None }),
-            Some(value) => Ok(Some(get_timestamp(value)?))
+            Some(value) => Ok(Some(get_timestamp(value)?)),
         }
     }
 
-    let info_rv = ctx.api.update_release(ctx.get_org()?,
+    let info_rv = ctx.api.update_release(
+        ctx.get_org()?,
         matches.value_of("version").unwrap(),
         &UpdatedRelease {
             projects: ctx.get_projects(matches).ok(),
-            url: matches.value_of("url").map(|x| x.to_owned()),
+            url: matches.value_of("url").map(str::to_owned),
             date_started: get_date(matches.value_of("started"), false)?,
             date_released: get_date(matches.value_of("released"), true)?,
             ..Default::default()
-        })?;
+        },
+    )?;
     println!("Finalized release {}.", info_rv.version);
     Ok(())
 }
 
-fn execute_propose_version() -> Result<()>
-{
+fn execute_propose_version() -> Result<(), Error> {
     println!("{}", detect_release_name()?);
     Ok(())
 }
 
-fn execute_set_commits<'a>(ctx: &ReleaseContext,
-                           matches: &ArgMatches<'a>) -> Result<()>
-{
+fn execute_set_commits<'a>(
+    ctx: &ReleaseContext<'_>,
+    matches: &ArgMatches<'a>,
+) -> Result<(), Error> {
     let version = matches.value_of("version").unwrap();
     let org = ctx.get_org()?;
     let repos = ctx.api.list_organization_repos(org)?;
     let mut commit_specs = vec![];
 
     if repos.is_empty() {
-        return Err(Error::from("No repositories are configured in Sentry for \
-                                your organization."));
+        bail!(
+            "No repositories are configured in Sentry for \
+             your organization."
+        );
     }
 
     let heads = if matches.is_present("auto") {
-        let commits = find_heads(None, repos)?;
+        let commits = find_heads(None, &repos)?;
         if commits.is_empty() {
-            return Err(Error::from("Could not determine any commits to be associated \
-                                    automatically. You will have to explicitly provide \
-                                    commits on the command line."));
+            let config = Config::current();
+
+            bail!(
+                "Could not determine any commits to be associated automatically.\n\
+                 Please provide commits explicitly using --commit | -c.\n\
+                 \n\
+                 HINT: Did you add the repo to your organization?\n\
+                 Configure it at {}/settings/{}/repos/",
+                config.get_base_url()?,
+                org
+            );
         }
         Some(commits)
     } else if matches.is_present("clear") {
@@ -414,14 +446,14 @@ fn execute_set_commits<'a>(ctx: &ReleaseContext,
         if let Some(commits) = matches.values_of("commits") {
             for spec in commits {
                 let commit_spec = CommitSpec::parse(spec)?;
-                if (&repos).iter().filter(|r| r.name == commit_spec.repo).next().is_some() {
+                if repos.iter().any(|r| r.name == commit_spec.repo) {
                     commit_specs.push(commit_spec);
                 } else {
-                    return Err(Error::from(format!("Unknown repo '{}'", commit_spec.repo)));
+                    bail!("Unknown repo '{}'", commit_spec.repo);
                 }
             }
         }
-        let commits = find_heads(Some(commit_specs), repos)?;
+        let commits = find_heads(Some(commit_specs), &repos)?;
         if commits.is_empty() {
             None
         } else {
@@ -431,11 +463,14 @@ fn execute_set_commits<'a>(ctx: &ReleaseContext,
 
     // make sure the release exists if projects are given
     if let Ok(projects) = ctx.get_projects(matches) {
-        ctx.api.new_release(&org, &NewRelease {
-            version: version.into(),
-            projects: projects,
-            ..Default::default()
-        })?;
+        ctx.api.new_release(
+            &org,
+            &NewRelease {
+                version: version.into(),
+                projects,
+                ..Default::default()
+            },
+        )?;
     }
 
     if let Some(heads) = heads {
@@ -443,14 +478,16 @@ fn execute_set_commits<'a>(ctx: &ReleaseContext,
             println!("Clearing commits for release.");
         } else {
             let mut table = Table::new();
-            table.title_row()
-                .add("Repository")
-                .add("Revision");
+            table.title_row().add("Repository").add("Revision");
             for commit in &heads {
                 let row = table.add_row();
                 row.add(&commit.repo);
                 if let Some(ref prev_rev) = commit.prev_rev {
-                    row.add(format!("{} -> {}", strip_sha(prev_rev), strip_sha(&commit.rev)));
+                    row.add(format!(
+                        "{} -> {}",
+                        strip_sha(prev_rev),
+                        strip_sha(&commit.rev)
+                    ));
                 } else {
                     row.add(strip_sha(&commit.rev));
                 }
@@ -465,45 +502,65 @@ fn execute_set_commits<'a>(ctx: &ReleaseContext,
     Ok(())
 }
 
-fn execute_delete<'a>(ctx: &ReleaseContext,
-                      matches: &ArgMatches<'a>) -> Result<()> {
+fn execute_delete<'a>(ctx: &ReleaseContext<'_>, matches: &ArgMatches<'a>) -> Result<(), Error> {
     let version = matches.value_of("version").unwrap();
     let project = ctx.get_project_default().ok();
-    if ctx.api.delete_release(ctx.get_org()?, project.as_ref().map(|x| x.as_str()), version)? {
+    if ctx.api.delete_release(
+        ctx.get_org()?,
+        project.as_ref().map(String::as_ref),
+        version,
+    )? {
         println!("Deleted release {}!", version);
     } else {
-        println!("Did nothing. Release with this version ({}) does not exist.",
-                 version);
+        println!(
+            "Did nothing. Release with this version ({}) does not exist.",
+            version
+        );
     }
     Ok(())
 }
 
-fn execute_list<'a>(ctx: &ReleaseContext,
-                    matches: &ArgMatches<'a>) -> Result<()> {
+fn execute_list<'a>(ctx: &ReleaseContext<'_>, matches: &ArgMatches<'a>) -> Result<(), Error> {
     let project = ctx.get_project_default().ok();
-    let releases = ctx.api.list_releases(ctx.get_org()?, project.as_ref().map(|x| x.as_str()))?;
-    let abbrev = !matches.is_present("no_abbrev");
+    let releases = ctx
+        .api
+        .list_releases(ctx.get_org()?, project.as_ref().map(String::as_ref))?;
     let mut table = Table::new();
-    table.title_row()
-        .add("Released")
-        .add("Version")
-        .add("New Events")
-        .add("Last Event");
+    let title_row = table.title_row();
+    title_row.add("Released").add("Version");
+    if matches.is_present("show_projects") {
+        title_row.add("Projects");
+    }
+    title_row.add("New Events").add("Last Event");
     for release_info in releases {
         let row = table.add_row();
         if let Some(date) = release_info.date_released {
-            row.add(format!("{} ago", HumanDuration(Utc::now().signed_duration_since(date))));
+            row.add(format!(
+                "{} ago",
+                HumanDuration(Utc::now().signed_duration_since(date))
+            ));
         } else {
             row.add("(unreleased)");
         }
-        if abbrev {
-            row.add(strip_version(&release_info.version));
-        } else {
-            row.add(&release_info.version);
+        row.add(&release_info.version);
+        if matches.is_present("show_projects") {
+            let project_slugs = release_info
+                .projects
+                .into_iter()
+                .map(|p| p.slug)
+                .collect::<Vec<_>>();
+            if !project_slugs.is_empty() {
+                row.add(project_slugs.join("\n"));
+            } else {
+                row.add("-");
+            }
         }
         row.add(release_info.new_groups);
         if let Some(date) = release_info.last_event {
-            row.add(format!("{} ago", HumanDuration(Utc::now().signed_duration_since(date))));
+            row.add(format!(
+                "{} ago",
+                HumanDuration(Utc::now().signed_duration_since(date))
+            ));
         } else {
             row.add("-");
         }
@@ -512,55 +569,45 @@ fn execute_list<'a>(ctx: &ReleaseContext,
     Ok(())
 }
 
-fn execute_info<'a>(ctx: &ReleaseContext,
-                    matches: &ArgMatches<'a>) -> Result<()> {
+fn execute_info<'a>(ctx: &ReleaseContext<'_>, matches: &ArgMatches<'a>) -> Result<(), Error> {
     let version = matches.value_of("version").unwrap();
     let org = ctx.get_org()?;
     let project = ctx.get_project_default().ok();
-    let release = ctx.api.get_release(org, project.as_ref().map(|x| x.as_str()),
-                                      &version)?;
+    let release = ctx
+        .api
+        .get_release(org, project.as_ref().map(String::as_ref), &version)?;
 
     // quiet mode just exists
     if matches.is_present("quiet") {
         if release.is_none() {
-            return Err(ErrorKind::QuietExit(1).into());
+            return Err(QuietExit(1).into());
         }
         return Ok(());
     }
 
     if let Some(release) = release {
-        let short_version = strip_version(&release.version);
         let mut tbl = Table::new();
-        tbl.add_row()
-            .add("Version")
-            .add(short_version);
-        if short_version != &release.version {
-            tbl.add_row()
-                .add("Full version")
-                .add(&release.version);
-        }
-        tbl.add_row()
-            .add("Date created")
-            .add(&release.date_created);
+        tbl.add_row().add("Version").add(&release.version);
+        tbl.add_row().add("Date created").add(&release.date_created);
         if let Some(last_event) = release.last_event {
-            tbl.add_row()
-                .add("Last event")
-                .add(last_event);
+            tbl.add_row().add("Last event").add(last_event);
         }
         tbl.print();
     } else {
         println!("No such release");
-        return Err(ErrorKind::QuietExit(1).into());
+        return Err(QuietExit(1).into());
     }
     Ok(())
 }
 
-fn execute_files_list<'a>(ctx: &ReleaseContext,
-                          _matches: &ArgMatches<'a>,
-                          release: &str)
-                          -> Result<()> {
+fn execute_files_list<'a>(
+    ctx: &ReleaseContext<'_>,
+    _matches: &ArgMatches<'a>,
+    release: &str,
+) -> Result<(), Error> {
     let mut table = Table::new();
-    table.title_row()
+    table
+        .title_row()
         .add("Name")
         .add("Distribution")
         .add("Source Map")
@@ -568,8 +615,10 @@ fn execute_files_list<'a>(ctx: &ReleaseContext,
 
     let org = ctx.get_org()?;
     let project = ctx.get_project_default().ok();
-    for artifact in ctx.api.list_release_files(
-            org, project.as_ref().map(|x| x.as_str()), release)? {
+    for artifact in
+        ctx.api
+            .list_release_files(org, project.as_ref().map(String::as_ref), release)?
+    {
         let row = table.add_row();
         row.add(&artifact.name);
         if let Some(ref dist) = artifact.dist {
@@ -590,46 +639,55 @@ fn execute_files_list<'a>(ctx: &ReleaseContext,
     Ok(())
 }
 
-fn execute_files_delete<'a>(ctx: &ReleaseContext,
-                            matches: &ArgMatches<'a>,
-                            release: &str)
-                            -> Result<()> {
+fn execute_files_delete<'a>(
+    ctx: &ReleaseContext<'_>,
+    matches: &ArgMatches<'a>,
+    release: &str,
+) -> Result<(), Error> {
     let files: HashSet<String> = match matches.values_of("names") {
         Some(paths) => paths.map(|x| x.into()).collect(),
         None => HashSet::new(),
     };
     let org = ctx.get_org()?;
     let project = ctx.get_project_default().ok();
-    for file in ctx.api.list_release_files(org, project.as_ref().map(|x| x.as_str()), release)? {
+    for file in ctx
+        .api
+        .list_release_files(org, project.as_ref().map(String::as_ref), release)?
+    {
         if !(matches.is_present("all") || files.contains(&file.name)) {
             continue;
         }
-        if ctx.api.delete_release_file(org, project.as_ref().map(|x| x.as_str()), release, &file.id)? {
+        if ctx.api.delete_release_file(
+            org,
+            project.as_ref().map(String::as_ref),
+            release,
+            &file.id,
+        )? {
             println!("D {}", file.name);
         }
     }
     Ok(())
 }
 
-fn execute_files_upload<'a>(ctx: &ReleaseContext,
-                            matches: &ArgMatches<'a>,
-                            version: &str)
-                            -> Result<()> {
+fn execute_files_upload<'a>(
+    ctx: &ReleaseContext<'_>,
+    matches: &ArgMatches<'a>,
+    version: &str,
+) -> Result<(), Error> {
     let path = Path::new(matches.value_of("path").unwrap());
     let name = match matches.value_of("name") {
         Some(name) => name,
-        None => {
-            Path::new(path).file_name()
-                .and_then(|x| x.to_str())
-                .ok_or("No filename provided.")?
-        }
+        None => Path::new(path)
+            .file_name()
+            .and_then(OsStr::to_str)
+            .ok_or_else(|| err_msg("No filename provided."))?,
     };
     let dist = matches.value_of("dist");
     let mut headers = vec![];
     if let Some(header_list) = matches.values_of("header") {
         for header in header_list {
             if !header.contains(':') {
-                fail!("Invalid header. Needs to be in key:value format");
+                bail!("Invalid header. Needs to be in key:value format");
             }
             let mut iter = header.splitn(2, ':');
             let key = iter.next().unwrap();
@@ -639,32 +697,116 @@ fn execute_files_upload<'a>(ctx: &ReleaseContext,
     };
     let org = ctx.get_org()?;
     let project = ctx.get_project_default().ok();
-    if let Some(artifact) = ctx.api.upload_release_file(org,
-            project.as_ref().map(|x| x.as_str()), &version,
-            FileContents::FromPath(&path), &name, dist, Some(&headers[..]))? {
+    if let Some(artifact) = ctx.api.upload_release_file(
+        org,
+        project.as_ref().map(String::as_ref),
+        &version,
+        &FileContents::FromPath(&path),
+        &name,
+        dist,
+        Some(&headers[..]),
+        ProgressBarMode::Request,
+    )? {
         println!("A {}  ({} bytes)", artifact.sha1, artifact.size);
     } else {
-        fail!("File already present!");
+        bail!("File already present!");
     }
     Ok(())
 }
 
-fn execute_files_upload_sourcemaps<'a>(ctx: &ReleaseContext,
-                                       matches: &ArgMatches<'a>,
-                                       version: &str)
-                                       -> Result<()> {
-    let url_prefix = matches.value_of("url_prefix").unwrap_or("~").trim_right_matches("/");
-    let paths = matches.values_of("paths").unwrap();
-    let extensions = matches.values_of("extensions")
-        .map(|extensions| extensions.map(|ext| ext.trim_left_matches(".")).collect())
-        .unwrap_or(vec!["js", "map", "jsbundle", "bundle"]);
-    let ignores = matches.values_of("ignore").map(|ignores| ignores
-        .map(|i| format!("!{}", i))
-        .collect::<Vec<_>>());
-    let ignore_file = matches.value_of("ignore_file");
-    let dist = matches.value_of("dist");
+fn get_url_prefix_from_args<'a, 'b>(matches: &'b ArgMatches<'a>) -> &'b str {
+    let mut rv = matches.value_of("url_prefix").unwrap_or("~");
+    // remove a single slash from the end.  so ~/ becomes ~ and app:/// becomes app://
+    if rv.ends_with('/') {
+        rv = &rv[..rv.len() - 1];
+    }
+    rv
+}
 
-    let mut processor = SourceMapProcessor::new();
+fn get_url_suffix_from_args<'a, 'b>(matches: &'b ArgMatches<'a>) -> &'b str {
+    matches.value_of("url_suffix").unwrap_or("")
+}
+
+fn get_prefixes_from_args<'a, 'b>(matches: &'b ArgMatches<'a>) -> Vec<&'b str> {
+    let mut prefixes: Vec<&str> = match matches.values_of("strip_prefix") {
+        Some(paths) => paths.collect(),
+        None => vec![],
+    };
+    if matches.is_present("strip_common_prefix") {
+        prefixes.push("~");
+    }
+    prefixes
+}
+
+fn process_sources_from_bundle<'a>(
+    matches: &ArgMatches<'a>,
+    processor: &mut SourceMapProcessor,
+) -> Result<(), Error> {
+    let url_prefix = get_url_prefix_from_args(matches);
+    let url_suffix = get_url_suffix_from_args(matches);
+
+    let bundle_path = PathBuf::from(matches.value_of("bundle").unwrap());
+    let bundle_url = format!(
+        "{}/{}{}",
+        url_prefix,
+        bundle_path.file_name().unwrap().to_string_lossy(),
+        url_suffix
+    );
+
+    let sourcemap_path = PathBuf::from(matches.value_of("bundle_sourcemap").unwrap());
+    let sourcemap_url = format!(
+        "{}/{}{}",
+        url_prefix,
+        sourcemap_path.file_name().unwrap().to_string_lossy(),
+        url_suffix
+    );
+
+    debug!("Bundle path: {}", bundle_path.display());
+    debug!("Sourcemap path: {}", sourcemap_path.display());
+
+    processor.add(&bundle_url, &bundle_path)?;
+    processor.add(&sourcemap_url, &sourcemap_path)?;
+
+    if let Ok(ram_bundle) = sourcemap::ram_bundle::RamBundle::parse_unbundle_from_path(&bundle_path)
+    {
+        debug!("File RAM bundle found, extracting its contents...");
+        // For file ("unbundle") RAM bundles we need to explicitly unpack it, otherwise we cannot detect it
+        // reliably inside "processor.rewrite()"
+        processor.unpack_ram_bundle(&ram_bundle, &bundle_url)?;
+    } else if sourcemap::ram_bundle::RamBundle::parse_indexed_from_path(&bundle_path).is_ok() {
+        debug!("Indexed RAM bundle found");
+    } else {
+        warn!("Regular bundle found");
+    }
+
+    let mut prefixes = get_prefixes_from_args(matches);
+    if !prefixes.contains(&"~") {
+        prefixes.push("~");
+    }
+    debug!("Prefixes: {:?}", prefixes);
+
+    processor.rewrite(&prefixes)?;
+    processor.add_sourcemap_references()?;
+
+    Ok(())
+}
+
+fn process_sources_from_paths<'a>(
+    matches: &ArgMatches<'a>,
+    processor: &mut SourceMapProcessor,
+) -> Result<(), Error> {
+    let paths = matches.values_of("paths").unwrap();
+    let extensions = matches
+        .values_of("extensions")
+        .map(|extensions| extensions.map(|ext| ext.trim_start_matches('.')).collect())
+        .unwrap_or_else(|| vec!["js", "map", "jsbundle", "bundle"]);
+    let ignores = matches
+        .values_of("ignore")
+        .map(|ignores| ignores.map(|i| format!("!{}", i)).collect::<Vec<_>>());
+    let ignore_file = matches.value_of("ignore_file");
+
+    let url_prefix = get_url_prefix_from_args(matches);
+    let url_suffix = get_url_suffix_from_args(matches);
 
     for path in paths {
         // if we start walking over something that is an actual file then
@@ -679,14 +821,13 @@ fn execute_files_upload_sourcemaps<'a>(ctx: &ReleaseContext,
         };
 
         let mut builder = WalkBuilder::new(path);
-        builder.git_exclude(false)
-            .git_ignore(false)
-            .ignore(false);
+        builder.git_exclude(false).git_ignore(false).ignore(false);
 
         if check_ignore {
             let mut types_builder = TypesBuilder::new();
             for ext in &extensions {
-                types_builder.add(ext, &format!("*.{}", ext))?;
+                let ext_name = ext.replace('.', "__");
+                types_builder.add(&ext_name, &format!("*.{}", ext))?;
             }
             builder.types(types_builder.select("all").build()?);
 
@@ -711,21 +852,28 @@ fn execute_files_upload_sourcemaps<'a>(ctx: &ReleaseContext,
                 continue;
             }
 
-            info!("found: {} ({} bytes)", file.path().display(), file.metadata().unwrap().len());
+            info!(
+                "found: {} ({} bytes)",
+                file.path().display(),
+                file.metadata().unwrap().len()
+            );
             let local_path = file.path().strip_prefix(&base_path).unwrap();
-            let url = format!("{}/{}", url_prefix, path_as_url(local_path));
+            let url = format!("{}/{}{}", url_prefix, path_as_url(local_path), url_suffix);
             processor.add(&url, file.path())?;
         }
     }
 
+    // We want to change the default from --no-rewrite to --rewrite, but we need to transition
+    // users to explicitly pass the option first such that we don't break their setup when we do.
+    if !matches.is_present("no_rewrite") && !matches.is_present("rewrite") {
+        warn!(
+            "The default --no-rewrite will disappear. Please specify --rewrite or \
+             --no-rewrite explicitly during sourcemap upload."
+        )
+    }
+
     if matches.is_present("rewrite") {
-        let mut prefixes: Vec<&str> = match matches.values_of("strip_prefix") {
-            Some(paths) => paths.collect(),
-            None => vec![],
-        };
-        if matches.is_present("strip_common_prefix") {
-            prefixes.push("~");
-        }
+        let prefixes = get_prefixes_from_args(matches);
         processor.rewrite(&prefixes)?;
     }
 
@@ -737,25 +885,47 @@ fn execute_files_upload_sourcemaps<'a>(ctx: &ReleaseContext,
         processor.validate_all()?;
     }
 
+    Ok(())
+}
+
+fn execute_files_upload_sourcemaps<'a>(
+    ctx: &ReleaseContext<'_>,
+    matches: &ArgMatches<'a>,
+    version: &str,
+) -> Result<(), Error> {
+    let mut processor = SourceMapProcessor::new();
+
+    if matches.is_present("bundle") && matches.is_present("bundle_sourcemap") {
+        process_sources_from_bundle(matches, &mut processor)?;
+    } else {
+        process_sources_from_paths(matches, &mut processor)?;
+    }
+
     let org = ctx.get_org()?;
+    let project = ctx.get_project_default().ok();
 
     // make sure the release exists
-    let release = ctx.api.new_release(&org, &NewRelease {
-        version: version.into(),
-        projects: ctx.get_projects(matches)?,
-        ..Default::default()
-    })?;
+    let release = ctx.api.new_release(
+        &org,
+        &NewRelease {
+            version: version.into(),
+            projects: ctx.get_projects(matches)?,
+            ..Default::default()
+        },
+    )?;
 
-    let project = ctx.get_project_default().ok();
-    processor.upload(&ctx.api, org, project.as_ref().map(|x| x.as_str()),
-                     &release.version, dist)?;
+    processor.upload(&UploadContext {
+        org,
+        project: project.as_ref().map(String::as_str),
+        release: &release.version,
+        dist: matches.value_of("dist"),
+        wait: matches.is_present("wait"),
+    })?;
 
     Ok(())
 }
 
-fn execute_files<'a>(ctx: &ReleaseContext,
-                     matches: &ArgMatches<'a>)
-                     -> Result<()> {
+fn execute_files<'a>(ctx: &ReleaseContext<'_>, matches: &ArgMatches<'a>) -> Result<(), Error> {
     let release = matches.value_of("version").unwrap();
     if let Some(sub_matches) = matches.subcommand_matches("list") {
         return execute_files_list(ctx, sub_matches, release);
@@ -772,15 +942,15 @@ fn execute_files<'a>(ctx: &ReleaseContext,
     unreachable!();
 }
 
-fn execute_deploys_new<'a>(ctx: &ReleaseContext,
-                           matches: &ArgMatches<'a>,
-                           version: &str)
-    -> Result<()>
-{
+fn execute_deploys_new<'a>(
+    ctx: &ReleaseContext<'_>,
+    matches: &ArgMatches<'a>,
+    version: &str,
+) -> Result<(), Error> {
     let mut deploy = Deploy {
         env: matches.value_of("env").unwrap().to_string(),
-        name: matches.value_of("name").map(|x| x.to_string()),
-        url: matches.value_of("url").map(|x| x.to_string()),
+        name: matches.value_of("name").map(str::to_owned),
+        url: matches.value_of("url").map(str::to_owned),
         ..Default::default()
     };
 
@@ -801,7 +971,7 @@ fn execute_deploys_new<'a>(ctx: &ReleaseContext,
 
     let org = ctx.get_org()?;
     let deploy = ctx.api.create_deploy(org, version, &deploy)?;
-    let mut name = deploy.name.as_ref().map(|x| x.as_str()).unwrap_or("");
+    let mut name = deploy.name.as_ref().map(String::as_ref).unwrap_or("");
     if name == "" {
         name = "unnamed";
     }
@@ -811,26 +981,26 @@ fn execute_deploys_new<'a>(ctx: &ReleaseContext,
     Ok(())
 }
 
-fn execute_deploys_list<'a>(ctx: &ReleaseContext,
-                            _matches: &ArgMatches<'a>,
-                            version: &str)
-    -> Result<()>
-{
+fn execute_deploys_list<'a>(
+    ctx: &ReleaseContext<'_>,
+    _matches: &ArgMatches<'a>,
+    version: &str,
+) -> Result<(), Error> {
     let mut table = Table::new();
-    table.title_row()
+    table
+        .title_row()
         .add("Environment")
         .add("Name")
         .add("Finished");
 
     for deploy in ctx.api.list_deploys(ctx.get_org()?, version)? {
-        let mut name = deploy.name.as_ref().map(|x| x.as_str()).unwrap_or("");
+        let mut name = deploy.name.as_ref().map(String::as_ref).unwrap_or("");
         if name == "" {
             name = "unnamed";
         }
-        table.add_row()
-            .add(deploy.env)
-            .add(name)
-            .add(HumanDuration(Utc::now().signed_duration_since(deploy.finished.unwrap())));
+        table.add_row().add(deploy.env).add(name).add(HumanDuration(
+            Utc::now().signed_duration_since(deploy.finished.unwrap()),
+        ));
     }
 
     if table.is_empty() {
@@ -842,8 +1012,7 @@ fn execute_deploys_list<'a>(ctx: &ReleaseContext,
     Ok(())
 }
 
-fn execute_deploys<'a>(ctx: &ReleaseContext,
-                       matches: &ArgMatches<'a>) -> Result<()> {
+fn execute_deploys<'a>(ctx: &ReleaseContext<'_>, matches: &ArgMatches<'a>) -> Result<(), Error> {
     let release = matches.value_of("version").unwrap();
     if let Some(sub_matches) = matches.subcommand_matches("new") {
         return execute_deploys_new(ctx, sub_matches, release);
@@ -854,15 +1023,15 @@ fn execute_deploys<'a>(ctx: &ReleaseContext,
     unreachable!();
 }
 
-pub fn execute<'a>(matches: &ArgMatches<'a>) -> Result<()> {
+pub fn execute<'a>(matches: &ArgMatches<'a>) -> Result<(), Error> {
     // this one does not need a context or org
     if let Some(_sub_matches) = matches.subcommand_matches("propose-version") {
         return execute_propose_version();
     }
 
-    let config = Config::get_current();
+    let config = Config::current();
     let ctx = ReleaseContext {
-        api: Api::get_current(),
+        api: Api::current(),
         org: config.get_org(matches)?,
         project_default: matches.value_of("project"),
     };

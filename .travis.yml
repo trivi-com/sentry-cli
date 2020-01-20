@@ -1,75 +1,18 @@
 language: generic
-sudo: required
 dist: trusty
 services:
   - docker
 
-if: tag IS blank
+env:
+  global:
+    - SENTRY_ORG=sentry-cli-travis-test
+    # SENTRY_AUTH_TOKEN
+    - secure: "ttDTQaBws1yMz+aTEsQRxiiVGT2v/7KXMskATFxQGjTiPn3InJc9SQDbqtgrFiRJsc5NGJSKKmgR6IV8HqkYcimzpNZkUmzIZ/JkOv6yz4Gag7CHNrzk2OezoUvYglO8JCiR/WlkEHsGA6OjYaSaL1++FOPVfij56TYmWVp1fZH0pSmrD0o7qtEauUI5vExwB1GuPP0C0Drogf6gYMPoF89tetubM7NVyXCGr7HYPpzo3dDDOUOH/6R/RdGAr5AjA69qJQ0j4w/0ptw9kJt0frC8JF5l6zavufodcRnWFB4MHRQSDwvXtSWO1eiYsNrmeVMRrND2bxSNPDJhrlVH4sJNw1DKlCWfV1EdRlLcOh1du1Aq99jRB+oOXuxQbBUd9rH6A3ZIU+8IYP4QonmLlG+8WvhhmEYoq5ERBXdWfG2BDUKqa4XaCdTej/6AYnbG0DDwzOIZ6AuFIDhXUB60Z0t+tLOe2aSK3yXIxz0Wy+DsGqcHW0wYSiGeB1Vn/CFt1jh+HvD923X5BQtH3xsfTDQWrps4RntK3GrTaLYULiNCHoDyvb9bprmVQhB+smST53QOKsN73YsqPSEt9D6QHzeYxqVI5jSi7HFZX4EyZLGoXASnCWAdeC799FDRUdI3ncE48ojeg6PpHvLl5CWt87v1uWIq7kPsnO1W9mB2Rqs="
 
-matrix:
-  include:
-    - os: linux
-      env: TARGET=i686-unknown-linux-gnu DOCKER=alexcrichton/rust-slave-dist:2015-10-20b
-    - os: linux
-      env: TARGET=x86_64-unknown-linux-gnu DOCKER=alexcrichton/rust-slave-dist:2015-10-20b
-
-    # Build on older OS X for more portable binaries
-    - os: osx
-      osx_image: xcode6.4
-      env: TARGET=x86_64-apple-darwin
-
-    # Test minimum js
-    - os: linux
-      sudo: false
-      language: node_js
-      node_js: "4"
-      install: true
-      script: npm install && npm test
-      env: SENTRYCLI_LOCAL_CDNURL="http://localhost:8999/"
-
-    # Test latest js
-    - os: linux
-      sudo: false
-      language: node_js
-      node_js: "8"
-      install: true
-      script: npm install && npm test
-      env: SENTRYCLI_LOCAL_CDNURL="http://localhost:8999/"
-
-    # Build the @sentry/cli NPM package
-    - os: linux
-      sudo: false
-      language: node_js
-      node_js: "8"
-      install: true
-      script: npm pack
-      before_deploy: mkdir -p dist && mv *.tgz dist/package.tgz
-      env: TARGET=npm
-
-
-install:
-  - export PATH="$PATH:$HOME/.cargo/bin"
-  - bash .ci/install.sh
-
-script:
-  - mkdir -p target
-  - if [ ! -z "$DOCKER" ]; then
-      docker run
-        --entrypoint bash
-        -u `id -u`:`id -g`
-        -v $HOME/rust:/travis-rust:ro
-        -v `pwd`:/buildslave:ro
-        -v `pwd`/target:/buildslave/target
-        -e TARGET=$TARGET
-        -e SKIP_TESTS=$SKIP_TESTS
-        -it $DOCKER
-        .ci/build-docker.sh;
-    else
-      PATH=$HOME/rust/bin:$PATH sh .ci/build.sh;
-    fi
-
-before_cache:
-  - chmod -R a+r $HOME/.cargo
+branches:
+  only:
+  - master
+  - /^release\/[\d.]+$/
 
 cache:
   directories:
@@ -77,17 +20,94 @@ cache:
     - $HOME/.cargo
     - $TRAVIS_BUILD_DIR/target
 
-before_deploy: python .ci/move-asset.py
+before_install:
+  - npm install -g @zeus-ci/cli
+  - git fetch --tags
 
-deploy:
-  provider: s3
-  access_key_id: AKIAJKYWAF3QS7SFL75Q
-  secret_access_key:
-    secure: ChlFKqMUfbQvGY/mfczQOSorb5ZePWZVbcqkabOEdusXa16I5GxOKjHtf5ND6wo+uQ8w8o6OyfexiEPywdnMJRklp/Byw4PkfLVdk09vR1z1nzXTEPbVFLbDY6b4H6FLeFIsq1ANZTRg12XA3reCkc6i5FmNwtlwvq2sjb/Z2i/VsIW1cPgSpX+ONc4l3c6k8LM9whD1M9/JXFaNfj1IFUNZlrf20RQdUCNPP5BwLqjneXhuw+rBRwJ2sTPgjBQWRa5YKKj+MR3dcw1MlMAwJeiZuTNksipl/CgP1RpyFIgIu9/JS74h4J9RWw/+VsD4pg4bZ7Q4TL0kGDhgwytDa0zSItWAmDSYEy306I2Be3uyhCKafTtoaXgDfaGXdQYDcruQYHoAdzxge2H1s/mc8weLYM0aLmIWzqsX4jktfABrp80INvbxiemoaudUmwsAbw/kfbxcIsPuVjY0kLuT9jyfcvLWVZSsxN5u/kqAVpDPGKl6leb5gQNpr5afUOEXXxkAWXJfU+GQi2Vc1PSX6Uwy0nosWaNN7FTnGjJ3jjJBppOM3n52Wp4IO8Z4wiINQUFRqOUTzZVh9lA1D2jAg/n2Y6w3F+60/+UtjHNswoaw+IszlzMzzNmsDkLAiBv1GHI5BVx7f48+ciMrduiZ+toepRmRHW1E1PLxW+aqLV0=
-  skip_cleanup: true
-  acl: public_read
-  bucket: getsentry-builds
-  upload-dir: $TRAVIS_REPO_SLUG/$TRAVIS_COMMIT
-  local_dir: dist
-  on:
-    condition: "-n $TARGET" # we only want to trigger deploy on TARGET
+matrix:
+  include:
+    - name: "check: format"
+      language: rust
+      script: make format-check
+
+    - name: "check: lint"
+      language: rust
+      script: make lint
+
+    - name: "test: rust"
+      language: rust
+      script: make test
+
+    - name: "test: node 4"
+      os: linux
+      language: node_js
+      node_js: "4"
+      install: true
+      env: SENTRYCLI_LOCAL_CDNURL="http://localhost:8999/"
+      script: npm install && npm test
+
+    - name: "test: node 10"
+      os: linux
+      language: node_js
+      node_js: "10"
+      install: true
+      env: SENTRYCLI_LOCAL_CDNURL="http://localhost:8999/"
+      script: npm install && npm test
+
+    - name: "build: linux x86"
+      os: linux
+      sudo: required
+      env:
+        - TARGET=i686-unknown-linux-musl
+        - DOCKER_TAG=i686-musl
+      script:
+        - bash scripts/build-in-docker.sh
+        - zeus upload -t "application/octet-stream"
+                      -n "sentry-cli-Linux-i686"
+                      "./target/${TARGET}/release/sentry-cli" || [[ ! "$TRAVIS_BRANCH" =~ ^release/ ]]
+
+    - name: "build: linux x86_64"
+      os: linux
+      sudo: required
+      env:
+        - TARGET=x86_64-unknown-linux-musl
+        - DOCKER_TAG=x86_64-musl
+      script:
+        - bash scripts/build-in-docker.sh
+        - zeus upload -t "application/octet-stream"
+                      -n "sentry-cli-Linux-x86_64"
+                      "./target/${TARGET}/release/sentry-cli" || [[ ! "$TRAVIS_BRANCH" =~ ^release/ ]]
+
+    - name: "build: macOS x86_64"
+      os: osx
+      # Build on older OS X for more portable binaries
+      osx_image: xcode8
+      language: rust
+      env:
+        - TARGET=x86_64-apple-darwin
+      script:
+        - cargo build --release --locked
+        - cargo run --release -- releases list || [[ ! "${TRAVIS_PULL_REQUEST_SLUG?x}" =~ ^(getsentry/sentry-cli)?$ ]]
+        - zeus upload -t "application/octet-stream"
+                      -n "sentry-cli-Darwin-x86_64"
+                      "./target/release/sentry-cli" || [[ ! "$TRAVIS_BRANCH" =~ ^release/ ]]
+
+    - name: "build: NPM package"
+      os: linux
+      language: node_js
+      node_js: "8"
+      install: true
+      env: TARGET=npm
+      script:
+        - npm pack
+        - zeus upload -t "application/tar+npm" *.tgz || [[ ! "$TRAVIS_BRANCH" =~ ^release/ ]]
+
+notifications:
+  webhooks:
+    urls:
+      - https://zeus.ci/hooks/94ed0760-efce-11e7-9b3c-0a580a282505/public/provider/travis/webhook
+    on_success: always
+    on_failure: always
+    on_start: always
+    on_cancel: always
+    on_error: always

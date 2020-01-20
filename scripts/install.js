@@ -6,11 +6,16 @@ const fs = require('fs');
 const http = require('http');
 const os = require('os');
 const path = require('path');
+const crypto = require('crypto');
+const zlib = require('zlib');
+const stream = require('stream');
 
 const HttpsProxyAgent = require('https-proxy-agent');
 const fetch = require('node-fetch');
 const ProgressBar = require('progress');
 const Proxy = require('proxy-from-env');
+const copyFileSync = require('fs-copy-file-sync');
+const mkdirp = require('mkdirp');
 
 const helper = require('../js/helper');
 const pkgInfo = require('../package.json');
@@ -19,7 +24,7 @@ const CDN_URL =
   process.env.SENTRYCLI_LOCAL_CDNURL ||
   process.env.npm_config_sentrycli_cdnurl ||
   process.env.SENTRYCLI_CDNURL ||
-  'https://github.com/getsentry/sentry-cli/releases/download';
+  'https://downloads.sentry-cdn.com/sentry-cli';
 
 function getDownloadUrl(platform, arch) {
   const releasesUrl = `${CDN_URL}/${pkgInfo.version}/sentry-cli`;
@@ -47,65 +52,109 @@ function createProgressBar(name, total) {
     });
   }
 
-  if (/yarn/.test(process.env.npm_config_user_agent)) {
-    let pct = null;
-    let current = 0;
-    return {
-      tick: length => {
-        current += length;
-        const next = Math.round(current / total * 100);
-        if (next > pct) {
-          pct = next;
-          process.stdout.write(`fetching ${name} ${pct}%\n`);
-        }
-      },
-    };
-  }
+  let pct = null;
+  let current = 0;
+  return {
+    tick: length => {
+      current += length;
+      const next = Math.round((current / total) * 100);
+      if (next > pct) {
+        pct = next;
+        process.stdout.write(`fetching ${name} ${pct}%\n`);
+      }
+    },
+  };
+}
 
-  return { tick: () => {} };
+function npmCache() {
+  const env = process.env;
+  return (
+    env.npm_config_cache ||
+    env.npm_config_yarn_offline_mirror ||
+    (env.APPDATA ? path.join(env.APPDATA, 'npm-cache') : path.join(os.homedir(), '.npm'))
+  );
+}
+
+function getCachedPath(url) {
+  const digest = crypto
+    .createHash('md5')
+    .update(url)
+    .digest('hex')
+    .slice(0, 6);
+
+  return path.join(
+    npmCache(),
+    'sentry-cli',
+    `${digest}-${path.basename(url).replace(/[^a-zA-Z0-9.]+/g, '-')}`
+  );
+}
+
+function getTempFile(cached) {
+  return `${cached}.${process.pid}-${Math.random()
+    .toString(16)
+    .slice(2)}.tmp`;
 }
 
 function downloadBinary() {
   const arch = os.arch();
   const platform = os.platform();
-  const outputPath = path.resolve(
-    __dirname,
-    platform === 'win32' ? '../bin/sentry-cli.exe' : '../sentry-cli'
-  );
-
-  if (fs.existsSync(outputPath)) {
-    return Promise.resolve();
-  }
+  const outputPath = helper.getPath();
 
   const downloadUrl = getDownloadUrl(platform, arch);
   if (!downloadUrl) {
     return Promise.reject(new Error(`unsupported target ${platform}-${arch}`));
   }
 
+  const cachedPath = getCachedPath(downloadUrl);
+  if (fs.existsSync(cachedPath)) {
+    copyFileSync(cachedPath, outputPath);
+    return Promise.resolve();
+  }
+
   const proxyUrl = Proxy.getProxyForUrl(downloadUrl);
   const agent = proxyUrl ? new HttpsProxyAgent(proxyUrl) : null;
 
-  // temporary fix for https://github.com/TooTallNate/node-https-proxy-agent/pull/43
-  if (agent) {
-    agent.defaultPort = 443;
-  }
-
-  return fetch(downloadUrl, { redirect: 'follow', agent }).then(response => {
+  return fetch(downloadUrl, {
+    agent,
+    compress: false,
+    headers: {
+      'accept-encoding': 'gzip, deflate, br',
+    },
+    redirect: 'follow',
+  }).then(response => {
     if (!response.ok) {
       throw new Error(`Received ${response.status}: ${response.statusText}`);
     }
 
+    const contentEncoding = response.headers.get('content-encoding');
+    let decompressor;
+    if (/\bgzip\b/.test(contentEncoding)) {
+      decompressor = zlib.createGunzip();
+    } else if (/\bdeflate\b/.test(contentEncoding)) {
+      decompressor = zlib.createInflate();
+    } else if (/\bbr\b/.test(contentEncoding)) {
+      decompressor = zlib.createBrotliDecompress();
+    } else {
+      decompressor = new stream.PassThrough();
+    }
     const name = downloadUrl.match(/.*\/(.*?)$/)[1];
     const total = parseInt(response.headers.get('content-length'), 10);
     const progressBar = createProgressBar(name, total);
+    const tempPath = getTempFile(cachedPath);
+    mkdirp.sync(path.dirname(tempPath));
 
     return new Promise((resolve, reject) => {
       response.body
         .on('error', e => reject(e))
         .on('data', chunk => progressBar.tick(chunk.length))
-        .pipe(fs.createWriteStream(outputPath, { mode: '0755' }))
+        .pipe(decompressor)
+        .pipe(fs.createWriteStream(tempPath, { mode: '0755' }))
         .on('error', e => reject(e))
-        .on('finish', () => resolve());
+        .on('close', () => resolve());
+    }).then(() => {
+      copyFileSync(tempPath, cachedPath);
+      copyFileSync(tempPath, outputPath);
+      fs.unlinkSync(tempPath);
     });
   });
 }
@@ -115,7 +164,9 @@ function checkVersion() {
     const version = output.replace('sentry-cli ', '').trim();
     const expected = process.env.SENTRYCLI_LOCAL_CDNURL ? 'DEV' : pkgInfo.version;
     if (version !== expected) {
-      throw new Error(`Unexpected sentry-cli version: ${version}`);
+      throw new Error(
+        `Unexpected sentry-cli version "${version}", expected "${expected}"`
+      );
     }
   });
 }

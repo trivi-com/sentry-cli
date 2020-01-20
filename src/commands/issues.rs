@@ -1,42 +1,52 @@
 //! Implements a command for issue management.
 use clap::{App, AppSettings, Arg, ArgMatches};
+use failure::{Error, ResultExt};
 
-use api::{Api, IssueFilter, IssueChanges};
-use config::Config;
-use errors::{Result, ResultExt};
-use utils::args::ArgExt;
+use crate::api::{Api, IssueChanges, IssueFilter};
+use crate::config::Config;
+use crate::utils::args::ArgExt;
 
 pub fn make_app<'a, 'b: 'a>(app: App<'a, 'b>) -> App<'a, 'b> {
     app.about("Manage issues in Sentry.")
         .setting(AppSettings::SubcommandRequiredElseHelp)
         .org_project_args()
-        .arg(Arg::with_name("status")
-            .long("status")
-            .short("s")
-            .value_name("STATUS")
-            .possible_values(&["resolved", "muted", "unresolved"])
-            .help("Select all issues matching a given status."))
-        .arg(Arg::with_name("all")
-            .long("all")
-            .short("a")
-            .help("Select all issues (this might be limited)."))
-        .arg(Arg::with_name("id")
-            .multiple(true)
-            .number_of_values(1)
-            .short("i")
-            .long("id")
-            .help("Select the issue with the given ID."))
-        .subcommand(App::new("resolve")
-            .about("Bulk resolve all selected issues.")
-            .arg(Arg::with_name("next_release")
-                .long("next-release")
-                .short("n")
-                .help("Only select issues in the next release.")))
+        .arg(
+            Arg::with_name("status")
+                .long("status")
+                .short("s")
+                .value_name("STATUS")
+                .possible_values(&["resolved", "muted", "unresolved"])
+                .help("Select all issues matching a given status."),
+        )
+        .arg(
+            Arg::with_name("all")
+                .long("all")
+                .short("a")
+                .help("Select all issues (this might be limited)."),
+        )
+        .arg(
+            Arg::with_name("id")
+                .multiple(true)
+                .number_of_values(1)
+                .short("i")
+                .long("id")
+                .help("Select the issue with the given ID."),
+        )
+        .subcommand(
+            App::new("resolve")
+                .about("Bulk resolve all selected issues.")
+                .arg(
+                    Arg::with_name("next_release")
+                        .long("next-release")
+                        .short("n")
+                        .help("Only select issues in the next release."),
+                ),
+        )
         .subcommand(App::new("mute").about("Bulk mute all selected issues."))
         .subcommand(App::new("unresolve").about("Bulk unresolve all selected issues."))
 }
 
-fn get_filter_from_matches<'a>(matches: &ArgMatches<'a>) -> Result<IssueFilter> {
+fn get_filter_from_matches<'a>(matches: &ArgMatches<'a>) -> Result<IssueFilter, Error> {
     if matches.is_present("all") {
         return Ok(IssueFilter::All);
     }
@@ -46,7 +56,7 @@ fn get_filter_from_matches<'a>(matches: &ArgMatches<'a>) -> Result<IssueFilter> 
     let mut ids = vec![];
     if let Some(values) = matches.values_of("id") {
         for value in values {
-            ids.push(value.parse().chain_err(|| "Invalid issue ID")?);
+            ids.push(value.parse::<u64>().context("Invalid issue ID")?);
         }
     }
 
@@ -57,12 +67,13 @@ fn get_filter_from_matches<'a>(matches: &ArgMatches<'a>) -> Result<IssueFilter> 
     }
 }
 
-fn execute_change(org: &str,
-                  project: &str,
-                  filter: &IssueFilter,
-                  changes: &IssueChanges)
-                  -> Result<()> {
-    if Api::get_current().bulk_update_issue(org, project, filter, changes)? {
+fn execute_change(
+    org: &str,
+    project: &str,
+    filter: &IssueFilter,
+    changes: &IssueChanges,
+) -> Result<(), Error> {
+    if Api::current().bulk_update_issue(org, project, filter, changes)? {
         println!("Updated matching issues.");
         if let Some(status) = changes.new_status.as_ref() {
             println!("  new status: {}", status);
@@ -73,8 +84,8 @@ fn execute_change(org: &str,
     Ok(())
 }
 
-pub fn execute<'a>(matches: &ArgMatches<'a>) -> Result<()> {
-    let config = Config::get_current();
+pub fn execute<'a>(matches: &ArgMatches<'a>) -> Result<(), Error> {
+    let config = Config::current();
     let (org, project) = config.get_org_and_project(matches)?;
     let filter = get_filter_from_matches(matches)?;
     let mut changes: IssueChanges = Default::default();
@@ -85,11 +96,11 @@ pub fn execute<'a>(matches: &ArgMatches<'a>) -> Result<()> {
         } else {
             changes.new_status = Some("resolved".into());
         }
-    } else if let Some(_) = matches.subcommand_matches("mute") {
+    } else if matches.subcommand_matches("mute").is_some() {
         changes.new_status = Some("muted".into());
-    } else if let Some(_) = matches.subcommand_matches("unresolve") {
+    } else if matches.subcommand_matches("unresolve").is_some() {
         changes.new_status = Some("unresolved".into());
     }
 
-    return execute_change(&org, &project, &filter, &changes);
+    execute_change(&org, &project, &filter, &changes)
 }

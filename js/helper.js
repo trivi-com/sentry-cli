@@ -9,11 +9,10 @@ const childProcess = require('child_process');
  * @type {string}
  */
 // istanbul ignore next
-let binaryPath =
-  os.platform() === 'win32'
-    ? path.resolve(__dirname, '..\\bin\\sentry-cli.exe')
-    : path.resolve(__dirname, '../sentry-cli');
-
+let binaryPath = path.resolve(
+  __dirname,
+  os.platform() === 'win32' ? '..\\sentry-cli.exe' : '../sentry-cli'
+);
 /**
  * Overrides the default binary path with a mock value, useful for testing.
  *
@@ -67,17 +66,19 @@ function serializeOptions(schema, options) {
       );
     }
 
-    if (paramType === 'boolean' || paramType === 'inverted-boolean') {
+    if (paramType === 'boolean') {
       if (typeof paramValue !== 'boolean') {
         throw new Error(`${option} should be a bool`);
       }
 
-      if (paramType === 'boolean' && paramValue) {
+      const invertedParamName = schema[option].invertedParam;
+
+      if (paramValue && paramName !== undefined) {
         return newOptions.concat([paramName]);
       }
 
-      if (paramType === 'inverted-boolean' && paramValue === false) {
-        return newOptions.concat([paramName]);
+      if (!paramValue && invertedParamName !== undefined) {
+        return newOptions.concat([invertedParamName]);
       }
 
       return newOptions;
@@ -126,15 +127,16 @@ function getPath() {
  *
  * @param {string[]} args Command line arguments passed to `sentry-cli`.
  * @param {boolean} live We inherit stdio to display `sentry-cli` output directly.
+ * @param {boolean} silent Disable stdout for silents build (CI/Webpack Stats, ...)
  * @returns {Promise.<string>} A promise that resolves to the standard output.
  */
-function execute(args, live) {
+function execute(args, live, silent) {
   const env = Object.assign({}, process.env);
   return new Promise((resolve, reject) => {
     if (live === true) {
       const pid = childProcess.spawn(getPath(), args, {
         env,
-        stdio: 'inherit',
+        stdio: ['inherit', silent ? 'pipe' : 'inherit', 'inherit'],
       });
       pid.on('exit', () => {
         resolve();
