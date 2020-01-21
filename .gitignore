@@ -5,6 +5,3 @@ target
 node_modules
 coverage
 dist
-
-/sentry-cli
-/sentry-cli.exe
